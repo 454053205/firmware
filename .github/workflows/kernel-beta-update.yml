@@ -1,0 +1,172 @@
+# Triggered when raspberrypi/firmware's extra/git_hash file changes,
+# i.e. a new upstream firmware/kernel pair is being shipped to
+# rpi-update. Kicks off a kernel beta build so
+# the matching kernel .deb lands on public/beta automatically.
+#
+# Required secrets (org or repo level):
+#   GITLAB_URL           GitLab instance URL.
+#   PACKAGING_TOKEN      Project access token on the linux-packaging
+#                        project: api scope, Maintainer role.
+#   BRIDGE_TOKEN         Project access token on the bridge project:
+#                        read_repository scope, Reporter role.
+#   PACKAGING_PROJECT    linux-packaging project path on GitLab.
+#   BRIDGE_PROJECT       Bridge tool's project path on GitLab.
+# Required variables (org or repo level):
+#   KERNEL_SOURCE_PATH   Path to the persistent raspberrypi/linux clone
+#                        on the runner. Variable rather than secret
+#                        because container.volumes is evaluated before
+#                        the secrets context is available.
+#   CI_AUTHOR_NAME       Name attributed to bridge-driven commits and
+#                        the debian/changelog entry.
+#   CI_AUTHOR_EMAIL      Email attributed to the same.
+
+name: kernel beta update
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Kernel ref to build (SHA, tag, or origin/branch). Blank = read extra/git_hash.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (no rpi/update, no GitLab push)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-beta-update
+  cancel-in-progress: true
+
+jobs:
+  # Gate the heavy trixie job on whether extra/git_hash actually moved.
+  # Compares the file's content at the push's parent and tip via
+  # raw.githubusercontent.com - no checkout needed, nothing touches the
+  # workspace.
+  detect:
+    runs-on: [self-hosted, linux, linux-bridge]
+    container:
+      image: debian:stable
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "workflow_dispatch; proceeding"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          api="https://api.github.com/repos/$REPO/contents/extra/git_hash"
+          fetch() {
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "$api?ref=$1" | tr -d '[:space:]'
+          }
+          before=$(fetch "$BEFORE")
+          after=$(fetch "$AFTER")
+          echo "before='$before' after='$after'"
+          if [ -z "$before" ] || [ -z "$after" ]; then
+            echo "could not determine extra/git_hash; skipping (re-run manually if needed)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "$before" = "$after" ]; then
+            echo "extra/git_hash unchanged; skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "extra/git_hash changed; proceeding"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  trixie:
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    runs-on: [self-hosted, linux, linux-bridge]
+    timeout-minutes: 30
+    environment: beta-release
+    container:
+      image: debian:stable
+      volumes:
+        - ${{ vars.KERNEL_SOURCE_PATH }}:${{ vars.KERNEL_SOURCE_PATH }}
+    env:
+      GITLAB_BASE: ${{ secrets.GITLAB_URL }}
+      GITLAB_PROJECT: ${{ secrets.PACKAGING_PROJECT }}
+      GITLAB_TOKEN: ${{ secrets.PACKAGING_TOKEN }}
+      LINUX_SRC: ${{ vars.KERNEL_SOURCE_PATH }}
+      GIT_AUTHOR_NAME: ${{ vars.CI_AUTHOR_NAME }}
+      GIT_AUTHOR_EMAIL: ${{ vars.CI_AUTHOR_EMAIL }}
+      GIT_COMMITTER_NAME: ${{ vars.CI_AUTHOR_NAME }}
+      GIT_COMMITTER_EMAIL: ${{ vars.CI_AUTHOR_EMAIL }}
+      DEBFULLNAME: ${{ vars.CI_AUTHOR_NAME }}
+      DEBEMAIL: ${{ vars.CI_AUTHOR_EMAIL }}
+    steps:
+      # All file work happens under /build (container-local). The bind-mounted
+      # workspace stays empty so host-side cleanup never has to fight
+      # root-owned files left behind by the container.
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            curl \
+            devscripts \
+            git \
+            git-buildpackage \
+            python3-minimal \
+            quilt
+          mkdir -p /build
+
+      - name: Sync bridge from GitLab
+        working-directory: /build
+        env:
+          BRIDGE_PROJECT: ${{ secrets.BRIDGE_PROJECT }}
+          BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+        run: |
+          host="${GITLAB_BASE#https://}"
+          clone_url="https://oauth2:${BRIDGE_TOKEN}@${host}/${BRIDGE_PROJECT}.git"
+          git clone --depth 1 "$clone_url" bridge
+
+      - name: Resolve kernel ref
+        id: kernel
+        working-directory: /build
+        run: |
+          if [ -n "${{ inputs.ref }}" ]; then
+            ref="${{ inputs.ref }}"
+          else
+            ref=$(curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/extra/git_hash" \
+              | tr -d '[:space:]')
+          fi
+          [ -n "$ref" ] || { echo "no kernel ref resolved" >&2; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Sync linux-packaging from GitLab
+        working-directory: /build
+        run: |
+          host="${GITLAB_BASE#https://}"
+          clone_url="https://oauth2:${GITLAB_TOKEN}@${host}/${GITLAB_PROJECT}.git"
+          git clone "$clone_url" linux-packaging
+
+      - name: Run bridge
+        working-directory: /build
+        run: |
+          git config --global --add safe.directory "$LINUX_SRC"
+          git -C "$LINUX_SRC" fetch --all --tags --prune
+          ./bridge/bridge beta \
+            ${{ inputs.dry_run && '--dry-run' || '' }} \
+            --packaging ./linux-packaging \
+            --linux "$LINUX_SRC" \
+            --codename trixie \
+            "${{ steps.kernel.outputs.ref }}"
